@@ -10,12 +10,13 @@ import collections
 import contextvars
 import functools
 import inspect
-
+import io
 import itertools
 import logging
 import random
 import sys
 import traceback
+from contextlib import contextmanager
 
 from dataclasses import dataclass
 from traceback import extract_tb, StackSummary
@@ -40,6 +41,8 @@ from typing import (
 )
 
 import monarch
+
+import torch
 from monarch import ActorFuture as Future
 from monarch._rust_bindings.hyperactor_extension.telemetry import enter_span, exit_span
 
@@ -410,19 +413,31 @@ class Port(Generic[R]):
         )
 
 
+from typing import NamedTuple
+
+R = TypeVar("R")
+
+T = TypeVar("T")
+
+
+class PortTuple(NamedTuple, Generic[R]):
+    sender: "Port[R]"
+    receiver: "PortReceiver[R]"
+
+    @staticmethod
+    def create(mailbox: Mailbox, once: bool = False) -> "PortTuple[Any]":
+        handle, receiver = mailbox.open_once_port() if once else mailbox.open_port()
+        port_ref = handle.bind()
+        return PortTuple(
+            Port(port_ref, mailbox, rank=None), PortReceiver(mailbox, receiver)
+        )
+
+
 # advance lower-level API for sending messages. This is intentially
 # not part of the Endpoint API because they way it accepts arguments
 # and handles concerns is different.
-def port(
-    endpoint: Endpoint[P, R], once: bool = False
-) -> Tuple["Port[R]", "PortReceiver[R]"]:
-    handle, receiver = (
-        endpoint._mailbox.open_once_port() if once else endpoint._mailbox.open_port()
-    )
-    port_ref: PortRef | OncePortRef = handle.bind()
-    return Port(port_ref, endpoint._mailbox, rank=None), PortReceiver(
-        endpoint._mailbox, receiver
-    )
+def port(endpoint: Endpoint[P, R], once: bool = False) -> "PortTuple[R]":
+    return PortTuple.create(endpoint._mailbox, once)
 
 
 def ranked_port(
@@ -599,10 +614,25 @@ def _pickle(obj: object) -> bytes:
     return msg
 
 
+@contextmanager
+def _load_tensors_on_cpu():
+    # Ensure that any tensors load from CPU via monkeypatching how Storages are
+    # loaded.
+    old = torch.storage._load_from_bytes
+    try:
+        torch.storage._load_from_bytes = lambda b: torch.load(
+            io.BytesIO(b), map_location="cpu", weights_only=False
+        )
+        yield
+    finally:
+        torch.storage._load_from_bytes = old
+
+
 def _unpickle(data: bytes, mailbox: Mailbox) -> Any:
-    # regardless of the mailboxes of the remote objects
-    # they all become the local mailbox.
-    return unflatten(data, itertools.repeat(mailbox))
+    with _load_tensors_on_cpu():
+        # regardless of the mailboxes of the remote objects
+        # they all become the local mailbox.
+        return unflatten(data, itertools.repeat(mailbox))
 
 
 class Actor(MeshTrait):
